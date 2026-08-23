@@ -34,6 +34,6 @@ app.include_router(chatbot_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 
 # Serve built React frontend if available
-dist_path = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+dist_path = Path(__file__).resolve().parents[2] / "frontend" / "industrial-ai-dashboard" / "out"
 if dist_path.exists():
     app.mount("/", StaticFiles(directory=str(dist_path), html=True), name="static")

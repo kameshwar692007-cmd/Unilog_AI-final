@@ -33,6 +33,10 @@ app.include_router(pipeline_router, prefix="/api")
 app.include_router(chatbot_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 
+@app.get("/")
+def root():
+    return {"status": "ok", "app": settings.app_name, "docs": "/docs"}
+
 # Serve built React frontend if available
 dist_path = Path(__file__).resolve().parents[2] / "frontend" / "industrial-ai-dashboard" / "out"
 if dist_path.exists():

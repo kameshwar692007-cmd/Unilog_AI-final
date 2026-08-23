@@ -515,11 +515,20 @@ function ConnectedResultsView({
   const [query, setQuery] = useState('')
   const [searching, setSearching] = useState(false)
   const [inspectProduct, setInspectProduct] = useState<ProductResult | null>(null)
+  
+  // Filters state
+  const [statusFilter, setStatusFilter] = useState<'all' | 'validated' | 'review'>('all')
+  const [mfrFilter, setMfrFilter] = useState<string>('all')
 
+  // Poll results every 2 seconds to load partial results in real time
   useEffect(() => {
     if (!jobId) return
-    void getResults(jobId)
-      .then((data) => {
+    let active = true
+    
+    const fetchResults = async () => {
+      try {
+        const data = await getResults(jobId)
+        if (!active) return
         setResults(data)
         if (selectedMpn) {
           const match = data.find((p) => String(p.PART_NUMBER ?? p.Mfg_Part_Num) === selectedMpn)
@@ -527,12 +536,43 @@ function ConnectedResultsView({
             setInspectProduct(match)
           }
         }
-      })
-      .catch((err) => setError(err instanceof Error ? err.message : 'Could not load catalog results.'))
+      } catch (err) {
+        if (active) setError(err instanceof Error ? err.message : 'Could not load catalog results.')
+      }
+    }
+    
+    void fetchResults()
+    const timer = window.setInterval(() => void fetchResults(), 2000)
+    
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
   }, [jobId, selectedMpn])
 
+  // Automatically reset results when query is cleared
+  useEffect(() => {
+    if (query === '' && jobId) {
+      void getResults(jobId)
+        .then(setResults)
+        .catch(() => {})
+    }
+  }, [query, jobId])
+
   async function search() {
-    if (!query.trim()) return
+    if (!query.trim()) {
+      setError('')
+      setSearching(true)
+      try {
+        const data = await getResults(jobId!)
+        setResults(data)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Could not reload results.')
+      } finally {
+        setSearching(false)
+      }
+      return
+    }
     setSearching(true)
     setError('')
     try {
@@ -544,6 +584,31 @@ function ConnectedResultsView({
       setSearching(false)
     }
   }
+
+  // Compute filters
+  const manufacturers = useMemo(() => {
+    const set = new Set<string>()
+    for (const r of results) {
+      const m = r.MANUFACTURER_NAME ?? r.Part_Manuf
+      if (m) set.add(String(m))
+    }
+    return Array.from(set).sort()
+  }, [results])
+
+  const filteredResults = useMemo(() => {
+    return results.filter((r) => {
+      // Status Filter
+      if (statusFilter === 'validated' && r._needs_human_review) return false
+      if (statusFilter === 'review' && !r._needs_human_review) return false
+      
+      // Manufacturer Filter
+      if (mfrFilter !== 'all') {
+        const m = r.MANUFACTURER_NAME ?? r.Part_Manuf
+        if (String(m) !== mfrFilter) return false
+      }
+      return true
+    })
+  }, [results, statusFilter, mfrFilter])
 
   return (
     <div className="flex flex-col gap-6">
@@ -576,29 +641,56 @@ function ConnectedResultsView({
       {!jobId && <EmptyPanel icon={PackageSearch} title="No completed job" description="Upload and run catalog enrichment to view products." />}
 
       {jobId && results.length === 0 && !error && (
-        <EmptyPanel icon={PackageSearch} title="No result rows returned" description="The enrichment job completed without product outputs." />
+        <EmptyPanel icon={PackageSearch} title="No result rows returned" description="The enrichment job is starting or completed without products." />
       )}
 
       {results.length > 0 && (
-        <Card className="border-border/60 bg-card/80 shadow-sm">
+        <Card className="border-border/60 bg-card/65 backdrop-blur-md shadow-lg transition-all">
           <CardContent className="overflow-auto p-4">
-            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex flex-1 gap-2 max-w-lg">
-                <Input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void search()
-                  }}
-                  placeholder="Search MPN, manufacturer, brand, or attribute..."
-                  className="h-9 text-xs"
-                />
-                <Button size="sm" onClick={() => void search()} disabled={searching || !query.trim()}>
-                  <Search className="mr-1.5 size-3.5" /> Search
-                </Button>
+            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div className="flex flex-1 flex-col gap-2 sm:flex-row max-w-2xl">
+                <div className="flex flex-1 gap-2">
+                  <Input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void search()
+                    }}
+                    placeholder="Search MPN, description, manufacturer, brand..."
+                    className="h-9 text-xs"
+                  />
+                  <Button size="sm" onClick={() => void search()} disabled={searching}>
+                    <Search className="mr-1.5 size-3.5" /> Search
+                  </Button>
+                </div>
+                
+                <div className="flex gap-2">
+                  {/* Status Filter */}
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value as any)}
+                    className="h-9 rounded-md border border-input bg-card px-3 py-1 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring text-muted-foreground"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="validated">Validated</option>
+                    <option value="review">Needs Review</option>
+                  </select>
+
+                  {/* Manufacturer Filter */}
+                  <select
+                    value={mfrFilter}
+                    onChange={(e) => setMfrFilter(e.target.value)}
+                    className="h-9 rounded-md border border-input bg-card px-3 py-1 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring text-muted-foreground max-w-[160px]"
+                  >
+                    <option value="all">All Manufacturers</option>
+                    {manufacturers.map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
-              <span className="font-mono text-xs text-muted-foreground">{results.length} records populated</span>
+              <span className="font-mono text-xs text-muted-foreground">{filteredResults.length} records shown ({results.length} total)</span>
             </div>
 
             <Table>
@@ -613,11 +705,11 @@ function ConnectedResultsView({
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {results.map((product, index) => {
+                {filteredResults.map((product, index) => {
                   const attributes = Object.keys(product).filter((key) => key.startsWith('ATTRIBUTE_VALUE ') && product[key])
                   const mpn = String(product.Mfg_Part_Num ?? product.PART_NUMBER ?? '')
                   return (
-                    <TableRow key={String(product._job_row_id ?? index)}>
+                    <TableRow key={String(product._job_row_id ?? index)} className="hover:bg-muted/40 transition-colors">
                       <TableCell className="font-bold text-foreground">{String(product.PART_NUMBER ?? product.Mfg_Part_Num ?? '—')}</TableCell>
                       <TableCell>{String(product.MANUFACTURER_NAME ?? product.Part_Manuf ?? '—')}</TableCell>
                       <TableCell>{String(product.BRAND_NAME ?? product.Unilog_Brand ?? '—')}</TableCell>
@@ -629,15 +721,15 @@ function ConnectedResultsView({
                       <TableCell>{attributes.length} populated</TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-1.5">
-                          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setInspectProduct(product)}>
+                          <Button variant="outline" size="sm" className="h-7 text-xs hover:border-primary/50 transition-colors" onClick={() => setInspectProduct(product)}>
                             <Info className="mr-1 size-3" /> Inspect
                           </Button>
                           {mpn && (
-                            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => onSelectProduct(mpn)}>
+                            <Button variant="outline" size="sm" className="h-7 text-xs hover:border-primary/50 transition-colors" onClick={() => onSelectProduct(mpn)}>
                               <FileSearch className="mr-1 size-3" /> Evidence
                             </Button>
                           )}
-                          <Button variant="ghost" size="icon" className="size-7 text-primary" onClick={() => onAddToCart(product)} title="Add to Cart / Export List">
+                          <Button variant="ghost" size="icon" className="size-7 text-primary hover:bg-primary/10 transition-colors" onClick={() => onAddToCart(product)} title="Add to Cart / Export List">
                             <ShoppingCart className="size-3.5" />
                           </Button>
                         </div>

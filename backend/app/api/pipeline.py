@@ -174,6 +174,10 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
     """Async background worker executing catalog enrichment concurrently."""
     logger.info(f"Starting background job execution: {job_id}")
     job = jobs_db[job_id]
+    job["stage"] = "enriching"
+    
+    # Initialize the results database list with placeholders so clients can poll partial outputs
+    products_db[job_id] = [None] * len(products_list)
     
     temp_specs_folder = cleanup_dir / "specs_downloads"
     temp_specs_folder.mkdir(parents=True, exist_ok=True)
@@ -199,11 +203,7 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
                 # Run synchronous graph invoke in worker thread
                 output_row = await asyncio.to_thread(enrich_product, product)
                 
-                has_review_flag = False
-                for attr_idx in range(1, 51):
-                    if output_row.get(f"ATTRIBUTE_VALUE {attr_idx}") == "NEEDS_HUMAN_REVIEW":
-                        has_review_flag = True
-                        break
+                has_review_flag = output_row.get("_structured_json", {}).get("needs_human_review", False)
                         
                 output_row["_job_row_id"] = f"{job_id}_{idx}"
                 output_row["_original_row"] = product.source_row
@@ -213,6 +213,7 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
                     needs_review_count += 1
                     
                 results_map[idx] = output_row
+                products_db[job_id][idx] = output_row
                 job["logs"].append(f"Row {product.source_row}: Enrichment completed successfully.")
             except Exception as e:
                 logger.error(f"Enrichment workflow crash for Row {product.source_row}: {e}")
@@ -224,7 +225,12 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
     tasks = [process_single_product(idx, p) for idx, p in enumerate(products_list)]
     await asyncio.gather(*tasks)
     
-    ordered_results = [results_map[i] for i in sorted(results_map.keys())]
+    # Filter out any unresolved placeholders
+    ordered_results = [results_map[i] for i in sorted(results_map.keys()) if i in results_map]
+    
+    job["stage"] = "validating"
+    job["needs_review_count"] = sum(1 for r in ordered_results if r.get("_needs_human_review"))
+    job["stage"] = "completed"
     job["status"] = "completed"
     products_db[job_id] = ordered_results
     
@@ -276,6 +282,7 @@ def upload_catalog(
         "id": job_id,
         "filename": file.filename,
         "status": "running",
+        "stage": "processing",
         "total_rows": len(products_list),
         "processed_rows": 0,
         "needs_review_count": 0,
@@ -304,7 +311,7 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
 def get_job_results(job_id: str) -> List[Dict[str, Any]]:
     if job_id not in products_db:
         return []
-    return products_db[job_id]
+    return [r for r in products_db[job_id] if r is not None]
 
 
 @router.get("/results/{job_id}/structured")
@@ -315,24 +322,48 @@ def get_job_results_structured(job_id: str) -> List[Dict[str, Any]]:
 
 
 
+class AttributeOverride(BaseModel):
+    value: str
+    confidence: float
+    reason: str
+
+class ReviewApproveRequest(BaseModel):
+    product_row_id: str
+    overrides: Dict[int, AttributeOverride]
+
+
 @router.get("/review/queue")
 def get_review_queue() -> List[Dict[str, Any]]:
     """Gathers all products across completed jobs that need human override/review."""
     queue = []
     for job_id, results in products_db.items():
         for product in results:
+            if product is None:
+                continue
             if product.get("_needs_human_review", False):
                 # Format attributes needing review
                 flagged_attrs = []
+                val_meta = product.get("_attribute_validation", {})
                 for idx in range(1, 51):
                     val_key = f"ATTRIBUTE_VALUE {idx}"
                     label_key = f"ATTRIBUTE_LABEL {idx}"
-                    if product.get(val_key) == "NEEDS_HUMAN_REVIEW":
-                        flagged_attrs.append({
-                            "slot": idx,
-                            "label": product.get(label_key),
-                            "value": "NEEDS_HUMAN_REVIEW"
-                        })
+                    label = product.get(label_key)
+                    if label:
+                        details = val_meta.get(label, {})
+                        is_flagged = False
+                        if product.get(val_key) == "NEEDS_HUMAN_REVIEW":
+                            is_flagged = True
+                        elif not details.get("lov", True) or not details.get("uom", True) or not details.get("source", True):
+                            is_flagged = True
+                        elif details.get("confidence", 1.0) < 0.8:
+                            is_flagged = True
+                            
+                        if is_flagged:
+                            flagged_attrs.append({
+                                "slot": idx,
+                                "label": label,
+                                "value": product.get(val_key) or ""
+                            })
                 queue.append({
                     "product_row_id": product.get("_job_row_id"),
                     "job_id": job_id,
@@ -345,6 +376,85 @@ def get_review_queue() -> List[Dict[str, Any]]:
                     "org_row": product.get("_original_row")
                 })
     return queue
+
+
+@router.post("/review/approve")
+def approve_review_item(req: ReviewApproveRequest) -> Dict[str, str]:
+    """Applies manual editor overrides to human-review attributes and clears review flags."""
+    row_id = req.product_row_id
+    parts = row_id.split("_")
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail="Invalid product row ID format")
+    
+    job_id = parts[0]
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid row index")
+        
+    if job_id not in products_db or idx >= len(products_db[job_id]):
+        raise HTTPException(status_code=404, detail="Product row not found")
+        
+    product = products_db[job_id][idx]
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product row is empty")
+        
+    validation = product.setdefault("_attribute_validation", {})
+    structured = product.setdefault("_structured_json", {})
+    attributes_list = structured.setdefault("attributes", [])
+    
+    for slot, override in req.overrides.items():
+        val_key = f"ATTRIBUTE_VALUE {slot}"
+        uom_key = f"ATTRIBUTE_UOM {slot}"
+        label_key = f"ATTRIBUTE_LABEL {slot}"
+        
+        attr_name = product.get(label_key)
+        if not attr_name:
+            continue
+            
+        product[val_key] = override.value
+        # Split unit suffix if any (e.g. "120 V" -> value "120", UOM "V")
+        normalized = ref_service.normalize_uom(override.value)
+        if normalized:
+            uom_parts = normalized.split(" ")
+            if len(uom_parts) == 2:
+                product[val_key] = uom_parts[0]
+                product[uom_key] = uom_parts[1]
+                
+        # Update validation status
+        details = validation.setdefault(attr_name, {})
+        details["lov"] = True
+        details["uom"] = True
+        details["source"] = True
+        details["confidence"] = override.confidence
+        details["reason"] = override.reason
+        
+        # Update structured json list
+        for attr_item in attributes_list:
+            if attr_item.get("name") == attr_name:
+                attr_item["value"] = product[val_key]
+                attr_item["normalized_value"] = product[val_key]
+                attr_item["lov_status"] = "compliant"
+                attr_item["uom_status"] = "compliant"
+                attr_item["confidence"] = int(override.confidence * 100)
+                attr_item["reason"] = override.reason
+                
+    product["_needs_human_review"] = False
+    structured["needs_human_review"] = False
+    structured["review_reason"] = "Approved by human editor"
+    
+    if job_id in jobs_db:
+        jobs_db[job_id]["needs_review_count"] = sum(
+            1 for p in products_db[job_id] if p is not None and p.get("_needs_human_review", False)
+        )
+        
+    try:
+        from app.services.enrichment.workflow import _save_cache
+        _save_cache()
+    except Exception:
+        pass
+        
+    return {"status": "ok"}
 
 
 @router.get("/evidence/{mfg_part_num}")
@@ -682,21 +792,23 @@ def approve_review_entry(
 def get_metrics_summary() -> Dict[str, Any]:
     """Calculates pipeline KPIs and accuracy rates dynamically from real processed data."""
     total_processed = 0
-    lov_compliant = 0
-    uom_compliant = 0
     char_limit_compliant = 0
     missing_fields = 0
-    evidence_backed = 0
     human_reviews = 0
     total_fields = 0
-    compliance = {
-        "lov": {"passed": 0, "failed": 0, "total": 0, "rate": 0.0},
-        "uom": {"passed": 0, "failed": 0, "total": 0, "rate": 0.0},
-        "source": {"passed": 0, "failed": 0, "total": 0, "rate": 0.0},
-    }
+    total_populated_fields = 0
+    
+    lov_total = 0
+    lov_passed = 0
+    uom_total = 0
+    uom_passed = 0
+    source_eligible = 0
+    source_passed = 0
     
     for job_id, results in products_db.items():
         for product in results:
+            if product is None:
+                continue
             total_processed += 1
             if product.get("_needs_human_review", False):
                 human_reviews += 1
@@ -719,32 +831,38 @@ def get_metrics_summary() -> Dict[str, Any]:
                     has_real_val = val and str(val).strip() != "" and str(val).strip() != "NEEDS_HUMAN_REVIEW"
                     
                     if has_real_val:
-                        if details.get("source"):
-                            evidence_backed += 1
-                            
-                        for key in ("lov", "uom", "source"):
-                            compliance[key]["total"] += 1
-                            if details.get(key):
-                                compliance[key]["passed"] += 1
-                            else:
-                                compliance[key]["failed"] += 1
+                        total_populated_fields += 1
+                        
+                        # LOV Compliance (only if LOV is applicable for this attribute)
+                        if details.get("lov_applicable", False):
+                            lov_total += 1
+                            if details.get("lov", False):
+                                lov_passed += 1
                                 
-                        if details.get("lov"):
-                            lov_compliant += 1
-                        if details.get("uom"):
-                            uom_compliant += 1
+                        # UOM Compliance (only if UOM is applicable/detected for this value)
+                        if details.get("uom_applicable", False):
+                            uom_total += 1
+                            if details.get("uom", False):
+                                uom_passed += 1
+                                
+                        # Source-Backed: eligible fields are all populated/enriched attribute fields
+                        source_eligible += 1
+                        if details.get("source", False):
+                            source_passed += 1
 
-    for key in ("lov", "uom", "source"):
-        tot = compliance[key]["total"]
-        passed = compliance[key]["passed"]
-        compliance[key]["rate"] = round((passed / tot) * 100, 2) if tot > 0 else 0.0
+    lov_rate = round((lov_passed / lov_total) * 100, 2) if lov_total > 0 else 100.0
+    uom_rate = round((uom_passed / uom_total) * 100, 2) if uom_total > 0 else 100.0
+    evidence_rate = round((source_passed / source_eligible) * 100, 2) if source_eligible > 0 else 100.0
+    
+    compliance = {
+        "lov": {"passed": lov_passed, "failed": lov_total - lov_passed, "total": lov_total, "rate": lov_rate},
+        "uom": {"passed": uom_passed, "failed": uom_total - uom_passed, "total": uom_total, "rate": uom_rate},
+        "source": {"passed": source_passed, "failed": source_eligible - source_passed, "total": source_eligible, "rate": evidence_rate},
+    }
 
     human_rate = round((human_reviews / total_processed) * 100, 2) if total_processed else 0.0
     invoice_limit = round((char_limit_compliant / total_processed) * 100, 2) if total_processed else 0.0
-    lov_rate = round((lov_compliant / total_fields) * 100, 2) if total_fields else 0.0
-    uom_rate = round((uom_compliant / total_fields) * 100, 2) if total_fields else 0.0
     missing_rate = round((missing_fields / total_fields) * 100, 2) if total_fields else 0.0
-    evidence_rate = round((evidence_backed / total_fields) * 100, 2) if total_fields else 0.0
 
     evaluated_accuracy = 95.8
     evaluation_report = Path(__file__).resolve().parents[3] / "evaluation" / "eval_report.json"

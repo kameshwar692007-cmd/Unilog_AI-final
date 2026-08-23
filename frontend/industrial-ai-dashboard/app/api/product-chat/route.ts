@@ -1,4 +1,4 @@
-const BACKEND_URL = (process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || 'https://unilog-ai-backend.onrender.com').replace(/\/+$/, '')
+const BACKEND_URL = (process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || 'https://unilog-ai-final-backedn.onrender.com').replace(/\/+$/, '')
 
 export async function POST(request: Request) {
   try {

@@ -501,10 +501,12 @@ function ConnectedPipelineView({
 // ----------------------------------------------------
 function ConnectedResultsView({
   jobId,
+  selectedMpn,
   onSelectProduct,
   onAddToCart,
 }: {
   jobId: string | null
+  selectedMpn: string | null
   onSelectProduct: (mpn: string) => void
   onAddToCart: (product: ProductResult) => void
 }) {
@@ -517,9 +519,17 @@ function ConnectedResultsView({
   useEffect(() => {
     if (!jobId) return
     void getResults(jobId)
-      .then(setResults)
+      .then((data) => {
+        setResults(data)
+        if (selectedMpn) {
+          const match = data.find((p) => String(p.PART_NUMBER ?? p.Mfg_Part_Num) === selectedMpn)
+          if (match) {
+            setInspectProduct(match)
+          }
+        }
+      })
       .catch((err) => setError(err instanceof Error ? err.message : 'Could not load catalog results.'))
-  }, [jobId])
+  }, [jobId, selectedMpn])
 
   async function search() {
     if (!query.trim()) return
@@ -807,6 +817,8 @@ function ConnectedEvidenceView({ mfgPartNum }: { mfgPartNum: string | null }) {
 function ConnectedReviewView() {
   const [items, setItems] = useState<Record<string, unknown>[]>([])
   const [error, setError] = useState('')
+  const [editingRowId, setEditingRowId] = useState<string | null>(null)
+  const [editValues, setEditValues] = useState<Record<number, { value: string; confidence: number; reason: string }>>({})
 
   const loadQueue = () =>
     void getReviewQueue()
@@ -815,20 +827,45 @@ function ConnectedReviewView() {
 
   useEffect(loadQueue, [])
 
-  async function resolve(item: Record<string, unknown>) {
+  function startEdit(item: Record<string, unknown>) {
     const rowId = String(item.product_row_id ?? '')
-    const flagged = Array.isArray(item.flagged_attributes) ? (item.flagged_attributes as { slot?: number; label?: string }[]) : []
-    if (!rowId || flagged.length === 0) return
-
-    const overrides: Record<number, string> = {}
+    const flagged = Array.isArray(item.flagged_attributes) ? (item.flagged_attributes as { slot: number; label: string }[]) : []
+    const initial: Record<number, { value: string; confidence: number; reason: string }> = {}
     for (const attr of flagged) {
-      const val = window.prompt(`Enter approved value for ${attr.label ?? `Attribute Slot ${attr.slot}`}:`, 'Stainless Steel')
-      if (val === null || !val.trim() || attr.slot === undefined) return
-      overrides[attr.slot] = val.trim()
+      initial[attr.slot] = {
+        value: '',
+        confidence: 1.0,
+        reason: 'Human Approved'
+      }
+    }
+    setEditValues(initial)
+    setEditingRowId(rowId)
+  }
+
+  async function handleSave(rowId: string) {
+    const overrides: Record<number, { value: string; confidence: number; reason: string }> = {}
+    let hasAny = false
+    for (const key of Object.keys(editValues)) {
+      const slot = Number(key)
+      const val = editValues[slot]
+      if (val.value.trim()) {
+        overrides[slot] = {
+          value: val.value.trim(),
+          confidence: val.confidence,
+          reason: val.reason,
+        }
+        hasAny = true
+      }
+    }
+
+    if (!hasAny) {
+      alert('Please enter at least one approved value.')
+      return
     }
 
     try {
       await approveReview(rowId, overrides)
+      setEditingRowId(null)
       loadQueue()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not approve review override.')
@@ -863,21 +900,100 @@ function ConnectedReviewView() {
 
           {items.length > 0 && (
             <div className="flex flex-col gap-3">
-              {items.map((item, index) => (
-                <div key={String(item.product_row_id ?? index)} className="flex items-center justify-between rounded-lg border p-4 text-xs bg-muted/20">
-                  <div className="flex flex-col gap-1">
-                    <span className="font-bold text-foreground text-sm">
-                      {String(item.mfg_part_num ?? item.part_number ?? 'Unknown Product')}
-                    </span>
-                    <span className="text-muted-foreground font-mono">
-                      {Array.isArray(item.flagged_attributes) ? `${item.flagged_attributes.length} attributes flagged for review` : 'Flagged'}
-                    </span>
+              {items.map((item, index) => {
+                const rowId = String(item.product_row_id ?? '')
+                const flagged = Array.isArray(item.flagged_attributes) ? (item.flagged_attributes as { slot: number; label: string }[]) : []
+                return (
+                  <div key={`${rowId}-${index}`} className="flex flex-col gap-4 rounded-lg border p-4 text-xs bg-muted/20">
+                    <div className="flex items-center justify-between">
+                      <div className="flex flex-col gap-1">
+                        <span className="font-bold text-foreground text-sm">
+                          {String(item.mfg_part_num ?? item.part_number ?? 'Unknown Product')}
+                        </span>
+                        <span className="text-muted-foreground font-mono">
+                          {flagged.length} attributes flagged for review
+                        </span>
+                      </div>
+                      {editingRowId !== rowId && (
+                        <Button size="sm" onClick={() => startEdit(item)}>
+                          <CheckCircle2 className="mr-1.5 size-3.5" /> Edit & Approve
+                        </Button>
+                      )}
+                    </div>
+
+                    {editingRowId === rowId && (
+                      <div className="mt-3 border-t pt-4 flex flex-col gap-4">
+                        {flagged.map((attr) => {
+                          const state = editValues[attr.slot] || { value: '', confidence: 1.0, reason: 'Human Approved' }
+                          return (
+                            <div key={attr.slot} className="grid gap-3 border rounded-lg p-3 bg-card/50">
+                              <span className="font-semibold text-xs text-foreground block">{attr.label} (Slot {attr.slot})</span>
+                              <div className="grid gap-3 md:grid-cols-3">
+                                {/* Approved Value */}
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[10px] font-bold text-muted-foreground uppercase">Approved Value</label>
+                                  <Input
+                                    value={state.value}
+                                    onChange={(e) => setEditValues(prev => ({
+                                      ...prev,
+                                      [attr.slot]: { ...prev[attr.slot], value: e.target.value }
+                                    }))}
+                                    placeholder="e.g. Stainless Steel"
+                                    className="h-8 text-xs"
+                                  />
+                                </div>
+                                {/* Confidence Score */}
+                                <div className="flex flex-col gap-1">
+                                  <div className="flex items-center justify-between text-[10px] font-bold text-muted-foreground uppercase">
+                                    <span>Confidence Score</span>
+                                    <span className="font-mono text-primary">{(state.confidence * 100).toFixed(0)}%</span>
+                                  </div>
+                                  <div className="flex items-center gap-2 h-8">
+                                    <input
+                                      type="range"
+                                      min="0.0"
+                                      max="1.0"
+                                      step="0.05"
+                                      value={state.confidence}
+                                      onChange={(e) => setEditValues(prev => ({
+                                        ...prev,
+                                        [attr.slot]: { ...prev[attr.slot], confidence: parseFloat(e.target.value) }
+                                      }))}
+                                      className="w-full accent-primary"
+                                    />
+                                  </div>
+                                </div>
+                                {/* Explainability Reason */}
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[10px] font-bold text-muted-foreground uppercase">Explainability / Reason</label>
+                                  <Input
+                                    value={state.reason}
+                                    onChange={(e) => setEditValues(prev => ({
+                                      ...prev,
+                                      [attr.slot]: { ...prev[attr.slot], reason: e.target.value }
+                                    }))}
+                                    placeholder="e.g. Manual validation override"
+                                    className="h-8 text-xs"
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+
+                        <div className="flex justify-end gap-2 mt-2">
+                          <Button size="sm" variant="outline" onClick={() => setEditingRowId(null)}>
+                            Cancel
+                          </Button>
+                          <Button size="sm" onClick={() => void handleSave(rowId)}>
+                            <CheckCircle2 className="mr-1.5 size-3.5" /> Save & Approve
+                          </Button>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <Button size="sm" onClick={() => void resolve(item)}>
-                    <CheckCircle2 className="mr-1.5 size-3.5" /> Approve & Override
-                  </Button>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </CardContent>
@@ -1023,6 +1139,10 @@ export default function IndustrialDashboard() {
       const res = await scanSearch(scanFile)
       setScanOpen(false)
       if (res.matches.length > 0) {
+        const match = res.matches[0]
+        if (match.job_id) {
+          setJobId(match.job_id)
+        }
         setSelectedMpn(res.detected_code)
         go('results')
       } else {
@@ -1039,7 +1159,7 @@ export default function IndustrialDashboard() {
     dashboard: <ConnectedDashboardView go={go} />,
     upload: <ConnectedUploadView onStarted={(id) => { setJobId(id); go('pipeline') }} />,
     pipeline: <ConnectedPipelineView jobId={jobId} onCompleted={() => go('results')} onViewResults={() => go('results')} />,
-    results: <ConnectedResultsView jobId={jobId} onSelectProduct={(mpn) => { setSelectedMpn(mpn); go('evidence') }} onAddToCart={handleAddToCart} />,
+    results: <ConnectedResultsView jobId={jobId} selectedMpn={selectedMpn} onSelectProduct={(mpn) => { setSelectedMpn(mpn); go('evidence') }} onAddToCart={handleAddToCart} />,
     evidence: <ConnectedEvidenceView mfgPartNum={selectedMpn} />,
     review: <ConnectedReviewView />,
     metrics: <ConnectedMetricsView />,

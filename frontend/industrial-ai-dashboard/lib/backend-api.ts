@@ -117,12 +117,20 @@ export function scanSearch(file: File) {
   })
 }
 
-export function approveReview(productRowId: string, overrides: Record<number, string> = {}) {
-  const params = new URLSearchParams({ product_row_id: productRowId })
-  return request<{ status: string }>(`/api/pipeline/review/approve?${params.toString()}`, {
+export type AttributeOverride = {
+  value: string
+  confidence: number
+  reason: string
+}
+
+export function approveReview(productRowId: string, overrides: Record<number, AttributeOverride>) {
+  return request<{ status: string }>('/api/pipeline/review/approve', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(overrides),
+    body: JSON.stringify({
+      product_row_id: productRowId,
+      overrides,
+    }),
   })
 }
 

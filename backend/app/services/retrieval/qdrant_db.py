@@ -74,10 +74,17 @@ class QdrantDBService:
             )
             logger.info(f"Created Qdrant collection: {COLLECTION_NAME}")
 
+    _embed_cache: Dict[str, List[float]] = {}
+
     def _get_embedding(self, text: str) -> List[float]:
         """Generate embedding using fastembed or fallback tracker."""
+        if text in self._embed_cache:
+            return self._embed_cache[text]
+            
         if self._use_local_embedder:
-            return DeterministicEmbedder.embed(text)
+            res = DeterministicEmbedder.embed(text)
+            self._embed_cache[text] = res
+            return res
         
         try:
             if self._embedding_model is None:
@@ -93,11 +100,15 @@ class QdrantDBService:
             # Embed text (bge-small-en-v1.5 outputs 384 dimensions)
             embeddings = list(self._embedding_model.embed([text]))
             if embeddings:
-                return embeddings[0].tolist()
+                res = embeddings[0].tolist()
+                self._embed_cache[text] = res
+                return res
         except Exception as e:
             logger.warning(f"Failed to generate fastembed vector ({e}). Falling back to deterministic hasher.")
             
-        return DeterministicEmbedder.embed(text)
+        res = DeterministicEmbedder.embed(text)
+        self._embed_cache[text] = res
+        return res
 
     def clear_database(self) -> None:
         """Delete and recreate the collection."""
@@ -207,6 +218,29 @@ class QdrantDBService:
             }))
         scored_hits.sort(key=lambda item: item[0], reverse=True)
         return [hit for _, hit in scored_hits[:limit]]
+
+    def has_mfg_part_num(self, mfg_part_num: str) -> bool:
+        """Check if a manufacturer part number already exists in Qdrant database using scroll."""
+        if not mfg_part_num:
+            return False
+        try:
+            response, _ = self.client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="mfg_part_num_normalized",
+                            match=MatchValue(value=mfg_part_num.strip().casefold())
+                        )
+                    ]
+                ),
+                limit=1,
+                with_payload=False,
+                with_vectors=False
+            )
+            return bool(response)
+        except Exception:
+            return False
 
 
 _client_instance: QdrantDBService | None = None

@@ -13,6 +13,7 @@ import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, Response
 
+from pydantic import BaseModel
 from app.models.product_input import ProductInput
 from app.services.ingestion.excel import ingest_excel
 from app.services.ingestion.pdf import PDFProcessor
@@ -118,8 +119,7 @@ async def ingest_and_index_specs(mfg_part_num: str, entry_row: ProductInput, tem
     qdrant = get_qdrant_service()
     
     # Check if this MPN details are already stored in vectors
-    existing = qdrant.retrieve(query="specs check", mfg_part_num=mfg_part_num, limit=1)
-    if existing:
+    if qdrant.has_mfg_part_num(mfg_part_num):
         logger.info(f"Qdrant vector indexes already populated for {mfg_part_num}")
         return
 
@@ -180,7 +180,7 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
     
     results_map: Dict[int, Dict[str, Any]] = {}
     needs_review_count = 0
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(20)
     
     async def process_single_product(idx: int, product: ProductInput):
         nonlocal needs_review_count
@@ -381,15 +381,65 @@ async def scan_search_products(file: UploadFile = File(...)) -> Dict[str, Any]:
     content = await file.read()
     filename = file.filename or ""
     
-    # Extract candidate MPNs or text tokens from filename or image stream
+    # Extract candidate MPNs or text tokens from filename or image stream using Gemini or fallback
     import re
-    tokens = re.findall(r"[A-Z0-9_-]{5,}", filename.upper())
+    tokens = []
+    detected_code = ""
     
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        try:
+            from google import genai
+            from google.genai import types
+            
+            client = genai.Client(api_key=api_key)
+            
+            prompt = """
+            You are an industrial product scanner. Analyze this product image, label, or barcode.
+            Extract any manufacturer part numbers (MPNs), model numbers, serial numbers, barcodes, or brands.
+            Identify the exact product code (MPN/model number) if visible.
+            Return a JSON object with:
+            {
+               "detected_code": "extracted model or part number or serial number, empty if none",
+               "brand": "extracted brand/manufacturer name, empty if none",
+               "product_name": "extracted short product name or description, empty if none"
+            }
+            """
+            
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(
+                        data=content,
+                        mime_type=file.content_type or "image/jpeg",
+                    ),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                )
+            )
+            
+            data = json.loads(response.text)
+            detected_code = data.get("detected_code", "").strip()
+            if detected_code:
+                tokens.append(detected_code)
+            logger.info("Gemini image scan result: %s", data)
+        except Exception as e:
+            logger.error("Gemini image scan failed: %s", e)
+            
+    if not tokens:
+        tokens = re.findall(r"[A-Z0-9_-]{5,}", filename.upper())
+        
     # Try searching database by extracted MPN tokens
     matches = []
-    detected_code = tokens[0] if tokens else "IMAGE_SCAN"
+    if not detected_code and tokens:
+        detected_code = tokens[0]
     
-    for candidate in (tokens if tokens else ["PDSH4816AF", "WDTS7024RZ"]):
+    # Fallback default candidates if everything fails
+    candidates = tokens if tokens else ["PDSH4816AF", "WDTS7024RZ"]
+    for candidate in candidates:
         results = search_products(query=candidate)
         if results:
             matches.extend(results)
@@ -406,7 +456,7 @@ async def scan_search_products(file: UploadFile = File(...)) -> Dict[str, Any]:
             unique_matches.append(item)
             
     return {
-        "detected_code": detected_code,
+        "detected_code": detected_code or "IMAGE_SCAN",
         "filename": filename,
         "matches": unique_matches,
     }
@@ -544,26 +594,41 @@ def export_product_evidence_pdf(mfg_part_num: str) -> Response:
     )
 
 
+class AttributeOverride(BaseModel):
+    value: str
+    confidence: float = 1.0
+    reason: str = "Human Approved"
+
+class ReviewApprovalRequest(BaseModel):
+    product_row_id: str
+    overrides: Dict[int, AttributeOverride] # slot_idx -> override details
+
+
 @router.post("/review/approve")
 def approve_review_entry(
-    product_row_id: str,
-    overrides: Dict[int, str]  # slot_idx -> manual override value override
+    req: ReviewApprovalRequest
 ) -> Dict[str, str]:
     """Allows user to manually override and approve values that failed LLM extraction or validation."""
     found = False
+    product_row_id = req.product_row_id
+    overrides = req.overrides
     
     # overrides contains {slot_idx: text}
     for job_id, results in products_db.items():
         for product in results:
             if product.get("_job_row_id") == product_row_id:
                 # Update attributes
-                for slot, val in overrides.items():
+                for slot, override_item in overrides.items():
                     slot_str = str(slot) # conversion
                     idx = int(slot_str)
                     
                     val_key = f"ATTRIBUTE_VALUE {idx}"
                     label_key = f"ATTRIBUTE_LABEL {idx}"
                     uom_key = f"ATTRIBUTE_UOM {idx}"
+                    
+                    val = override_item.value
+                    confidence = override_item.confidence
+                    reason = override_item.reason
                     
                     product[val_key] = val
                     # Re-run normalizing on overrides
@@ -576,6 +641,20 @@ def approve_review_entry(
                         else:
                             product[val_key] = normalized
                             product[uom_key] = ""
+                            
+                    # Update validation metadata
+                    if "_attribute_validation" not in product:
+                        product["_attribute_validation"] = {}
+                    
+                    label = product.get(label_key)
+                    if label:
+                        product["_attribute_validation"][label] = {
+                            "confidence": confidence,
+                            "lov": True,
+                            "uom": True,
+                            "source": True,
+                            "reason": reason
+                        }
                             
                 # Re-validate if needs human review remains
                 has_review_flag = False

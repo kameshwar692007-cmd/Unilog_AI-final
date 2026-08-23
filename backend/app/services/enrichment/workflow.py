@@ -840,9 +840,24 @@ def build_enrichment_graph():
 
 
 _graph_instance = None
+_enrich_cache = {}
 
 def enrich_product(product: ProductInput) -> dict[str, Any]:
     """Execute LangGraph enrichment pipeline on a single catalog product input."""
+    cache_key = (
+        product.mfg_part_num,
+        product.part_desc,
+        product.e1_brand,
+        product.unilog_brand,
+        product.dib_brand,
+        product.part_manuf,
+        product.specification_sheet,
+        product.ref_url_1,
+        product.ref_url_2,
+    )
+    if cache_key in _enrich_cache:
+        return _enrich_cache[cache_key]
+
     global _graph_instance
     if _graph_instance is None:
         _graph_instance = build_enrichment_graph()
@@ -889,4 +904,6 @@ def enrich_product(product: ProductInput) -> dict[str, Any]:
     }
     
     result = _graph_instance.invoke(state_input)
-    return result["final_output"]
+    output = result["final_output"]
+    _enrich_cache[cache_key] = output
+    return output

@@ -62,12 +62,31 @@ def chunk_pdf_elements(
 class PDFProcessor:
     """Processes manufacturer PDFs and extracts text, tables, page numbers, and metadata."""
 
+    _cache: dict[str, List[PDFElement]] = {}
+
     @classmethod
     def process_pdf(cls, file_path: str | Path) -> List[PDFElement]:
         path = Path(file_path)
         if not path.is_file():
             raise FileNotFoundError(f"PDF file not found: {path}")
 
+        import hashlib
+        file_hash = None
+        try:
+            file_hash = hashlib.md5(path.read_bytes()).hexdigest()
+            if file_hash in cls._cache:
+                logger.info(f"Using cached PDF elements for {path.name}")
+                return cls._cache[file_hash]
+        except Exception as cache_err:
+            logger.warning(f"Failed to calculate PDF file hash for cache: {cache_err}")
+
+        elements = cls._process_pdf_raw(path)
+        if file_hash and elements:
+            cls._cache[file_hash] = elements
+        return elements
+
+    @classmethod
+    def _process_pdf_raw(cls, path: Path) -> List[PDFElement]:
         elements: List[PDFElement] = []
         
         # Try using Docling first

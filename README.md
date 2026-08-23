@@ -43,6 +43,24 @@ An enterprise AI platform that enriches minimal catalog inputs into standardized
                        └──────────────────────────────┘
 ```
 
+## Technologies & Tools Used
+
+### Frontend Stack
+- **Next.js 16** & **React 19** with **TypeScript** for the user interface
+- **Tailwind CSS v4** & **Shadcn UI** for dark theme support and styling
+- **Lucide React** for icons
+
+### Backend Stack
+- **FastAPI** (Python 3.10+) for high-performance REST APIs
+- **Uvicorn** as the ASGI web server
+- **LangGraph** (StateGraph) for multi-step stateful corrective retry loops
+- **google-genai** (Gemini 2.5 Flash) for image scans, extraction, and chatbot Q&A
+- **Qdrant DB** (Local / In-Memory vector database) for hybrid semantic retrieval
+- **Docling** & **PyPDF** for PDF layout parsing and text extraction
+- **Pandas** & **OpenPyXL** for 252-column Excel catalog generation
+- **Httpx** for downloading PDF brochures and sheet resources
+- **Portalocker** for database lock safety
+
 ---
 
 ## Key Features

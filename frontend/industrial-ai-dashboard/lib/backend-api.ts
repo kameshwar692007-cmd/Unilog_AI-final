@@ -62,7 +62,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const data = await response.json().catch(() => null) as { detail?: string } | T | null
   if (!response.ok) {
     const detail = data && typeof data === 'object' && 'detail' in data ? data.detail : undefined
-    throw new Error(detail ?? `Backend request failed (${response.status})`)
+    throw new Error(detail ?? `Backend returned HTTP status ${response.status}`)
   }
   return data as T
 }

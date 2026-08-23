@@ -75,6 +75,73 @@ def generate_answer(state: ChatbotState) -> Dict[str, Any]:
     all_products = [p for rows in products_db.values() for p in rows]
     target_product = next((p for p in all_products if str(p.get("Mfg_Part_Num", "")) == mpn or str(p.get("PART_NUMBER", "")) == mpn), None)
     
+    # 3. Product Queries with evidence
+    evidence_text_blocks = []
+    citations = []
+    for chunk in evidence:
+        src = chunk.get("source", "brochure.pdf")
+        page = chunk.get("page_num", 1)
+        text = chunk.get("text", "")
+        evidence_text_blocks.append(f"[Source: {src}, Page {page}]: {text}")
+        citations.append(f"{src} (Page {page})")
+        
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            
+            # Dynamically formulate prompt based on intent
+            if intent == "general_query":
+                prompt = f"""
+You are the UNILOG AI Product Intelligence Assistant. Answer the User Query professionally.
+We are an industrial product master data enrichment platform featuring:
+- LangGraph Enrichment Engine (10-node pipeline)
+- Docling & PyPDF for manufacturer PDF layout processing and text chunking
+- Qdrant Local Vector DB for hybrid semantic retrieval
+- Gemini 2.5 Flash for extraction and chatbot Q&A
+- List of Values (LOV) vocabulary checking and Unit of Measure (UOM) compliance validation
+- Human Review Queue inline exceptions editor (value overrides, confidence range slider, and explainability reasons)
+
+User Query: "{query}"
+"""
+            elif intent == "comparison_query":
+                prompt = f"""
+You are the UNILOG AI Product Intelligence Assistant. Compare the products referenced in the User Query.
+Use the database records and any context you have to construct a comparative markdown table.
+
+User Query: "{query}"
+
+DATABASE RECORDS OR CONTEXT:
+{json.dumps(all_products[:20], indent=2)}
+"""
+            else:
+                prompt = f"""
+You are the UNILOG AI Product Intelligence Assistant. Answer the User Query based strictly on the provided Technical Evidence and Product Database Record.
+
+User Query: "{query}"
+Target Model: {mpn or 'General Product'}
+
+DATABASE RECORD:
+{json.dumps(target_product, indent=2) if target_product else 'No direct DB record loaded'}
+
+TECHNICAL EVIDENCE CHUNKS:
+{chr(10).join(evidence_text_blocks) if evidence_text_blocks else 'No PDF evidence chunks loaded'}
+
+INSTRUCTIONS:
+1. Base your answer only on facts present in the provided evidence or DB record. Cite document filenames and page numbers when stating specs.
+2. If an attribute is missing from the evidence, state clearly that it was not found in indexed manufacturer documents.
+3. Keep the response structured, clear, and professional.
+"""
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={"temperature": 0.2}
+            )
+            return {"answer": response.text, "verified": True}
+        except Exception as e:
+            logger.error(f"Gemini LLM chatbot call failed ({e}). Falling back to template response.")
+
     # 1. General Queries about UNILOG AI features, LOV, UOM, confidence, review
     if intent == "general_query":
         q_lower = query.lower()
@@ -104,47 +171,6 @@ def generate_answer(state: ChatbotState) -> Dict[str, Any]:
                "| **Depth Open 90°** | 50-1/4 in | 50-3/16 in |\n\n"
                "_Citations: Frigidaire PDSH4816AF Spec Sheet (Page 1), Whirlpool WDTS7024RZ Owners Manual (Page 1)_")
         return {"answer": ans, "verified": True}
-
-    # 3. Product Queries with evidence
-    evidence_text_blocks = []
-    citations = []
-    for chunk in evidence:
-        src = chunk.get("source", "brochure.pdf")
-        page = chunk.get("page_num", 1)
-        text = chunk.get("text", "")
-        evidence_text_blocks.append(f"[Source: {src}, Page {page}]: {text}")
-        citations.append(f"{src} (Page {page})")
-        
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if api_key:
-        try:
-            from google import genai
-            client = genai.Client(api_key=api_key)
-            prompt = f"""
-You are the UNILOG AI Product Intelligence Assistant. Answer the User Query based strictly on the provided Technical Evidence and Product Database Record.
-
-User Query: "{query}"
-Target Model: {mpn or 'General Product'}
-
-DATABASE RECORD:
-{json.dumps(target_product, indent=2) if target_product else 'No direct DB record loaded'}
-
-TECHNICAL EVIDENCE CHUNKS:
-{chr(10).join(evidence_text_blocks) if evidence_text_blocks else 'No PDF evidence chunks loaded'}
-
-INSTRUCTIONS:
-1. Base your answer only on facts present in the provided evidence or DB record. Cite document filenames and page numbers when stating specs.
-2. If an attribute is missing from the evidence, state clearly that it was not found in indexed manufacturer documents.
-3. Keep the response structured, clear, and professional.
-"""
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={"temperature": 0.2}
-            )
-            return {"answer": response.text, "verified": True}
-        except Exception as e:
-            logger.error(f"Gemini LLM chatbot call failed ({e}). Falling back to template response.")
 
     # Grounded template response fallback
     lines = [f"### Product Details for {mpn or 'Target Model'}"]

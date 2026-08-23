@@ -51,7 +51,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   const token = typeof window !== 'undefined' ? window.localStorage.getItem('unilog.accessToken') : null
   if (token) headers.set('Authorization', `Bearer ${token}`)
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  } catch (err) {
+    throw new Error(`Cannot reach backend at ${API_BASE}. ${err instanceof Error ? err.message : 'Network error'}`)
+  }
+
   const data = await response.json().catch(() => null) as { detail?: string } | T | null
   if (!response.ok) {
     const detail = data && typeof data === 'object' && 'detail' in data ? data.detail : undefined

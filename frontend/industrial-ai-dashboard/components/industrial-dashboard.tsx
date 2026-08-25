@@ -8,6 +8,7 @@ import {
   BarChart3,
   Bell,
   Boxes,
+  Camera,
   CheckCircle2,
   ChevronRight,
   ClipboardCheck,
@@ -54,6 +55,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import {
   approveReview,
+  cancelJob,
   evidencePdfUrl,
   exportUrl,
   getCurrentUser,
@@ -406,6 +408,7 @@ function ConnectedPipelineView({
 }) {
   const [job, setJob] = useState<Job | null>(null)
   const [error, setError] = useState('')
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
     if (!jobId) return
@@ -428,6 +431,18 @@ function ConnectedPipelineView({
     }
   }, [jobId, onCompleted])
 
+  const handleCancel = async () => {
+    if (!jobId) return
+    setCancelling(true)
+    try {
+      await cancelJob(jobId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not cancel job.')
+    } finally {
+      setCancelling(false)
+    }
+  }
+
   const progress = job && job.total_rows ? Math.round((job.processed_rows / job.total_rows) * 100) : 0
 
   return (
@@ -437,11 +452,18 @@ function ConnectedPipelineView({
         title="Processing Pipeline"
         description="Track live ingestion, vector retrieval, attribute extraction, validation, and publication progress."
         actions={
-          job?.status === 'completed' ? (
-            <Button size="sm" onClick={onViewResults}>
-              <Boxes className="mr-1.5 size-3.5" /> View Results
-            </Button>
-          ) : undefined
+          <div className="flex gap-2">
+            {job?.status === 'running' && (
+              <Button size="sm" variant="destructive" onClick={() => void handleCancel()} disabled={cancelling}>
+                <XCircle className="mr-1.5 size-3.5" /> {cancelling ? 'Cancelling...' : 'Cancel Processing'}
+              </Button>
+            )}
+            {job?.status === 'completed' && (
+              <Button size="sm" onClick={onViewResults}>
+                <Boxes className="mr-1.5 size-3.5" /> View Results
+              </Button>
+            )}
+          </div>
         }
       />
 
@@ -455,17 +477,33 @@ function ConnectedPipelineView({
                 <div>
                   <CardTitle className="text-sm font-bold">{job.filename}</CardTitle>
                   <CardDescription className="text-xs">
-                    Job ID: {job.id} · {job.processed_rows} of {job.total_rows} rows processed
+                    Job ID: {job.id} · Processing {job.processed_rows} / {job.total_rows} products
                   </CardDescription>
                 </div>
-                <StatusBadge tone={job.status === 'completed' ? 'success' : 'warning'}>{job.status}</StatusBadge>
+                <StatusBadge tone={job.status === 'completed' ? 'success' : job.status === 'cancelled' ? 'danger' : 'warning'}>
+                  {job.status}
+                </StatusBadge>
               </div>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
-              <Progress value={progress} className="h-2" />
-              <div className="flex justify-between font-mono text-xs text-muted-foreground">
-                <span>{progress}% complete</span>
-                <span>{job.needs_review_count} rows require human review</span>
+              <Progress value={progress} className="h-2.5" />
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-xs text-muted-foreground pt-1">
+                <div className="rounded border bg-muted/20 p-2">
+                  <span className="block text-[10px] text-muted-foreground uppercase">Progress</span>
+                  <span className="font-bold text-foreground text-sm">{progress}% ({job.processed_rows}/{job.total_rows})</span>
+                </div>
+                <div className="rounded border bg-muted/20 p-2">
+                  <span className="block text-[10px] text-emerald-600 dark:text-emerald-400 uppercase">Successful</span>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400 text-sm">{job.successful_rows ?? job.processed_rows}</span>
+                </div>
+                <div className="rounded border bg-muted/20 p-2">
+                  <span className="block text-[10px] text-rose-500 uppercase">Failed</span>
+                  <span className="font-bold text-rose-500 text-sm">{job.failed_rows ?? 0}</span>
+                </div>
+                <div className="rounded border bg-muted/20 p-2">
+                  <span className="block text-[10px] text-amber-500 uppercase">Human Review</span>
+                  <span className="font-bold text-amber-500 text-sm">{job.needs_review_count}</span>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -516,13 +554,16 @@ function ConnectedResultsView({
   const [searching, setSearching] = useState(false)
   const [inspectProduct, setInspectProduct] = useState<ProductResult | null>(null)
   
+  // Search query cache
+  const [searchCache] = useState<Map<string, ProductResult[]>>(() => new Map())
+
   // Filters state
   const [statusFilter, setStatusFilter] = useState<'all' | 'validated' | 'review'>('all')
   const [mfrFilter, setMfrFilter] = useState<string>('all')
 
-  // Poll results every 2 seconds to load partial results in real time
+  // Poll results every 3 seconds to load partial results in real time
   useEffect(() => {
-    if (!jobId) return
+    if (!jobId || query.trim() !== '') return
     let active = true
     
     const fetchResults = async () => {
@@ -542,48 +583,44 @@ function ConnectedResultsView({
     }
     
     void fetchResults()
-    const timer = window.setInterval(() => void fetchResults(), 2000)
+    const timer = window.setInterval(() => void fetchResults(), 3000)
     
     return () => {
       active = false
       window.clearInterval(timer)
     }
-  }, [jobId, selectedMpn])
+  }, [jobId, selectedMpn, query])
 
-  // Automatically reset results when query is cleared
+  // Debounce search query changes
   useEffect(() => {
-    if (query === '' && jobId) {
-      void getResults(jobId)
-        .then(setResults)
-        .catch(() => {})
-    }
-  }, [query, jobId])
-
-  async function search() {
     if (!query.trim()) {
-      setError('')
-      setSearching(true)
-      try {
-        const data = await getResults(jobId!)
-        setResults(data)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Could not reload results.')
-      } finally {
-        setSearching(false)
+      if (jobId) {
+        void getResults(jobId).then(setResults).catch(() => {})
       }
       return
     }
-    setSearching(true)
-    setError('')
-    try {
-      const matches = await searchProducts(query, jobId ?? undefined)
-      setResults(matches.map((m) => m.product))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Search query failed.')
-    } finally {
-      setSearching(false)
+
+    const trimmed = query.trim().toLowerCase()
+    if (searchCache.has(trimmed)) {
+      setResults(searchCache.get(trimmed)!)
+      return
     }
-  }
+
+    const timeout = setTimeout(() => {
+      setSearching(true)
+      setError('')
+      void searchProducts(trimmed, jobId ?? undefined)
+        .then((matches) => {
+          const res = matches.map((m) => m.product)
+          searchCache.set(trimmed, res)
+          setResults(res)
+        })
+        .catch((err) => setError(err instanceof Error ? err.message : 'Search request failed.'))
+        .finally(() => setSearching(false))
+    }, 300)
+
+    return () => clearTimeout(timeout)
+  }, [query, jobId, searchCache])
 
   // Compute filters
   const manufacturers = useMemo(() => {
@@ -597,11 +634,9 @@ function ConnectedResultsView({
 
   const filteredResults = useMemo(() => {
     return results.filter((r) => {
-      // Status Filter
       if (statusFilter === 'validated' && r._needs_human_review) return false
       if (statusFilter === 'review' && !r._needs_human_review) return false
       
-      // Manufacturer Filter
       if (mfrFilter !== 'all') {
         const m = r.MANUFACTURER_NAME ?? r.Part_Manuf
         if (String(m) !== mfrFilter) return false
@@ -653,15 +688,14 @@ function ConnectedResultsView({
                   <Input
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') void search()
-                    }}
                     placeholder="Search MPN, description, manufacturer, brand..."
                     className="h-9 text-xs"
                   />
-                  <Button size="sm" onClick={() => void search()} disabled={searching}>
-                    <Search className="mr-1.5 size-3.5" /> Search
-                  </Button>
+                  {searching && (
+                    <div className="flex items-center px-2">
+                      <RefreshCw className="size-3.5 animate-spin text-muted-foreground" />
+                    </div>
+                  )}
                 </div>
                 
                 <div className="flex gap-2">
@@ -1179,7 +1213,11 @@ export default function IndustrialDashboard() {
   
   const [cartItems, setCartItems] = useState<ProductResult[]>([])
   const [scanFile, setScanFile] = useState<File | null>(null)
+  const [scanPreviewUrl, setScanPreviewUrl] = useState<string | null>(null)
+  const [scanDetectedCode, setScanDetectedCode] = useState<string>('')
   const [scanLoading, setScanLoading] = useState(false)
+  const [scanError, setScanError] = useState('')
+  const [scanNoMatch, setScanNoMatch] = useState(false)
 
   const active = useMemo(() => nav.find((item) => item.id === view) ?? nav[0], [view])
 
@@ -1224,24 +1262,39 @@ export default function IndustrialDashboard() {
     setCartOpen(true)
   }
 
+  function handleScanFileSelect(file: File | null) {
+    setScanFile(file)
+    setScanDetectedCode('')
+    setScanError('')
+    setScanNoMatch(false)
+    if (file) {
+      setScanPreviewUrl(URL.createObjectURL(file))
+    } else {
+      setScanPreviewUrl(null)
+    }
+  }
+
   async function handleScanSubmit() {
     if (!scanFile) return
     setScanLoading(true)
+    setScanError('')
+    setScanNoMatch(false)
     try {
       const res = await scanSearch(scanFile)
-      setScanOpen(false)
+      setScanDetectedCode(res.detected_code ?? '')
       if (res.matches.length > 0) {
         const match = res.matches[0]
         if (match.job_id) {
           setJobId(match.job_id)
         }
         setSelectedMpn(res.detected_code)
+        setScanOpen(false)
         go('results')
       } else {
-        alert(`Scan detected token '${res.detected_code}', but no direct catalog matches found.`)
+        setScanNoMatch(true)
       }
-    } catch {
-      alert('Scan search request failed.')
+    } catch (err) {
+      setScanError(err instanceof Error ? err.message : 'Scan search request failed.')
     } finally {
       setScanLoading(false)
     }
@@ -1367,11 +1420,76 @@ export default function IndustrialDashboard() {
               <Button variant="ghost" size="icon" className="size-7" onClick={() => setScanOpen(false)}><X className="size-4" /></Button>
             </CardHeader>
             <CardContent className="pt-4 space-y-4">
-              <p className="text-xs text-muted-foreground">Upload a product image, barcode scan, or datasheet label to automatically search catalog matches.</p>
-              <Input type="file" accept="image/*" className="text-xs" onChange={(e) => setScanFile(e.target.files?.[0] ?? null)} />
-              <Button className="w-full text-xs font-medium" disabled={!scanFile || scanLoading} onClick={() => void handleScanSubmit()}>
-                {scanLoading ? 'Scanning & Parsing...' : 'Run Scan Search'}
-              </Button>
+              <p className="text-xs text-muted-foreground">Upload a product image, camera photo, or datasheet label to extract part numbers automatically.</p>
+              
+              <div className="flex gap-2">
+                <label className="flex-1 cursor-pointer">
+                  <div className="flex items-center justify-center gap-2 rounded-md border border-input bg-card p-2 text-xs font-semibold hover:bg-accent hover:text-accent-foreground">
+                    <CloudUpload className="size-4 text-primary" />
+                    <span>Choose File</span>
+                  </div>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => handleScanFileSelect(e.target.files?.[0] ?? null)}
+                  />
+                </label>
+                
+                <label className="flex-1 cursor-pointer">
+                  <div className="flex items-center justify-center gap-2 rounded-md border border-input bg-card p-2 text-xs font-semibold hover:bg-accent hover:text-accent-foreground">
+                    <Camera className="size-4 text-primary" />
+                    <span>Capture Photo</span>
+                  </div>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    className="hidden"
+                    onChange={(e) => handleScanFileSelect(e.target.files?.[0] ?? null)}
+                  />
+                </label>
+              </div>
+
+              {scanPreviewUrl && (
+                <div className="relative overflow-hidden rounded-lg border max-h-48 flex items-center justify-center bg-muted/40 p-2">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={scanPreviewUrl} alt="Scan preview" className="max-h-44 object-contain rounded" />
+                </div>
+              )}
+
+              {scanDetectedCode && (
+                <div className="flex flex-col gap-1.5 border rounded-lg p-3 bg-muted/20">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Detected Part Number / OCR Token</span>
+                  <Input
+                    value={scanDetectedCode}
+                    onChange={(e) => setScanDetectedCode(e.target.value)}
+                    className="h-8 text-xs font-mono"
+                  />
+                </div>
+              )}
+
+              {scanError && (
+                <Alert variant="destructive">
+                  <AlertTriangle className="size-4" />
+                  <AlertTitle>Scan failed</AlertTitle>
+                  <AlertDescription>{scanError}</AlertDescription>
+                </Alert>
+              )}
+
+              {scanNoMatch && (
+                <Alert className="border-amber-500/50 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                  <Info className="size-4" />
+                  <AlertTitle>No catalog match found</AlertTitle>
+                  <AlertDescription>Detected code &apos;{scanDetectedCode}&apos; does not exist in active dataset results.</AlertDescription>
+                </Alert>
+              )}
+
+              <div className="flex gap-2">
+                <Button className="w-full text-xs font-medium" disabled={!scanFile || scanLoading} onClick={() => void handleScanSubmit()}>
+                  {scanLoading ? 'Processing Image...' : scanDetectedCode ? 'Search Catalog for Part' : 'Extract & Scan Image'}
+                </Button>
+              </div>
             </CardContent>
           </Card>
         </div>

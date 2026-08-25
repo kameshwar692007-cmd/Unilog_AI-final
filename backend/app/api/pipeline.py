@@ -176,7 +176,6 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
     job = jobs_db[job_id]
     job["stage"] = "enriching"
     
-    # Initialize the results database list with placeholders so clients can poll partial outputs
     products_db[job_id] = [None] * len(products_list)
     
     temp_specs_folder = cleanup_dir / "specs_downloads"
@@ -184,23 +183,43 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
     
     results_map: Dict[int, Dict[str, Any]] = {}
     needs_review_count = 0
-    semaphore = asyncio.Semaphore(20)
+    successful_rows = 0
+    failed_rows = 0
     
+    # Safe concurrency limit to respect API rate limits
+    semaphore = asyncio.Semaphore(12)
+    
+    # In-job MPN spec caching to avoid duplicate downloads/indexing for repeated part numbers
+    processed_mpns: set[str] = set()
+
     async def process_single_product(idx: int, product: ProductInput):
-        nonlocal needs_review_count
-        async with semaphore:
-            mfg_part_num = product.mfg_part_num or f"ROW_{product.source_row}"
-            job["logs"].append(f"Row {product.source_row}: Ingesting specs for part: {mfg_part_num}")
+        nonlocal needs_review_count, successful_rows, failed_rows
+        
+        if job.get("cancelled"):
+            return
             
-            try:
-                await ingest_and_index_specs(mfg_part_num, product, temp_specs_folder)
-            except Exception as err:
-                logger.error(f"Spec ingestion error in job: {err}")
-                job["logs"].append(f"Row {product.source_row} Spec Ingestion Error: {err}")
+        async with semaphore:
+            if job.get("cancelled"):
+                return
+                
+            mfg_part_num = product.mfg_part_num or f"ROW_{product.source_row}"
+            
+            if mfg_part_num not in processed_mpns:
+                job["logs"].append(f"Row {product.source_row}: Ingesting specs for part: {mfg_part_num}")
+                try:
+                    await ingest_and_index_specs(mfg_part_num, product, temp_specs_folder)
+                    processed_mpns.add(mfg_part_num)
+                except Exception as err:
+                    logger.error(f"Spec ingestion error in job: {err}")
+                    job["logs"].append(f"Row {product.source_row} Spec Ingestion Error: {err}")
+            else:
+                job["logs"].append(f"Row {product.source_row}: Using cached specs index for part: {mfg_part_num}")
+                
+            if job.get("cancelled"):
+                return
                 
             job["logs"].append(f"Row {product.source_row}: Running LangGraph enrichment workflow on {mfg_part_num}")
             try:
-                # Run synchronous graph invoke in worker thread
                 output_row = await asyncio.to_thread(enrich_product, product)
                 
                 has_review_flag = output_row.get("_structured_json", {}).get("needs_human_review", False)
@@ -214,25 +233,31 @@ async def run_enrichment_background(job_id: str, products_list: List[ProductInpu
                     
                 results_map[idx] = output_row
                 products_db[job_id][idx] = output_row
+                successful_rows += 1
                 job["logs"].append(f"Row {product.source_row}: Enrichment completed successfully.")
             except Exception as e:
+                failed_rows += 1
                 logger.error(f"Enrichment workflow crash for Row {product.source_row}: {e}")
                 job["logs"].append(f"Row {product.source_row} enrichment workflow crashed: {e}")
                 
             job["processed_rows"] += 1
+            job["successful_rows"] = successful_rows
+            job["failed_rows"] = failed_rows
             job["needs_review_count"] = needs_review_count
 
     tasks = [process_single_product(idx, p) for idx, p in enumerate(products_list)]
     await asyncio.gather(*tasks)
     
-    # Filter out any unresolved placeholders
-    ordered_results = [results_map[i] for i in sorted(results_map.keys()) if i in results_map]
-    
-    job["stage"] = "validating"
-    job["needs_review_count"] = sum(1 for r in ordered_results if r.get("_needs_human_review"))
-    job["stage"] = "completed"
-    job["status"] = "completed"
-    products_db[job_id] = ordered_results
+    if job.get("cancelled"):
+        job["stage"] = "cancelled"
+        job["status"] = "cancelled"
+        job["logs"].append("Processing cancelled by user request.")
+    else:
+        ordered_results = [results_map[i] for i in sorted(results_map.keys()) if i in results_map]
+        job["stage"] = "completed"
+        job["status"] = "completed"
+        job["needs_review_count"] = sum(1 for r in ordered_results if r.get("_needs_human_review"))
+        products_db[job_id] = ordered_results
     
     try:
         shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -257,7 +282,6 @@ def upload_catalog(
     """Uploads an Excel catalog row input to launch the background workflow."""
     job_id = str(uuid.uuid4())
     
-    # Write to local workplace temp folder
     temp_dir = Path(__file__).resolve().parents[3] / "tmp" / f"job_{job_id}"
     temp_dir.mkdir(parents=True, exist_ok=True)
     
@@ -268,7 +292,6 @@ def upload_catalog(
         shutil.copyfileobj(file.file, buffer)
         
     try:
-        # Load entries using Ingestion Service (Handles XLS and CSV fallback)
         products_list = ingest_excel(temp_input_file)
     except Exception as err:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -285,11 +308,13 @@ def upload_catalog(
         "stage": "processing",
         "total_rows": len(products_list),
         "processed_rows": 0,
+        "successful_rows": 0,
+        "failed_rows": 0,
         "needs_review_count": 0,
+        "cancelled": False,
         "logs": ["Job started. Uploaded spreadsheet parsed successfully."]
     }
     
-    # Launch background job
     background_tasks.add_task(run_enrichment_background_thread, job_id, products_list, temp_dir)
     
     return {"job_id": job_id, "total_rows": len(products_list)}
@@ -305,6 +330,17 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs_db[job_id]
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> Dict[str, Any]:
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs_db[job_id]
+    job["cancelled"] = True
+    job["status"] = "cancelled"
+    job["logs"].append("Cancellation requested by user.")
+    return {"status": "cancelled", "message": "Job cancellation request received."}
 
 
 @router.get("/results/{job_id}")

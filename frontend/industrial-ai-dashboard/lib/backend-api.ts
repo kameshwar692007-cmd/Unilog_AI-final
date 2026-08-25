@@ -10,7 +10,10 @@ export type Job = {
   status: string
   total_rows: number
   processed_rows: number
+  successful_rows?: number
+  failed_rows?: number
   needs_review_count: number
+  cancelled?: boolean
   logs: string[]
 }
 
@@ -99,6 +102,10 @@ export function uploadCatalog(file: File) {
 
 export function getJob(jobId: string) {
   return request<Job>(`/api/pipeline/jobs/${jobId}`)
+}
+
+export function cancelJob(jobId: string) {
+  return request<{ status: string; message: string }>(`/api/pipeline/jobs/${jobId}/cancel`, { method: 'POST' })
 }
 
 export function getJobs() {
